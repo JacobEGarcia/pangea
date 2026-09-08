@@ -514,9 +514,10 @@ byId.para.spec.extras   = paraCrest(1.0);
 byId.lystro.spec.extras = tuskFace(1.0);
 
 /* ============================== GLB creature models ==============================
-   Real Blender-built, rigged, animated models in ./models (Walk/Idle/Graze clips,
-   Fly for the pterosaur). Loaded up front; any missing model falls back to the
-   procedural builder below. */
+   Blender-built, rigged, animated models in ./models. Land animals ship
+   Walk / Run / Idle / Graze / Call-or-Roar / Sleep / TailSwipe clips
+   (carnivores swap Graze for Bite), the pterosaur ships Fly / Glide / Call.
+   Loaded up front; any missing model falls back to the procedural builder. */
 const glbs = {};
 {
   const loader = new GLTFLoader();
@@ -534,17 +535,22 @@ function makeAnimalParts(ex) {
   const root = new THREE.Group(); root.add(inst);
   const mixer = new THREE.AnimationMixer(inst);
   const actions = {};
-  for (const c of g.animations) actions[c.name] = mixer.clipAction(c);
-  return { kind: 'glb', root, mixer, actions, current: null, currentAction: null };
+  const durations = {};
+  for (const c of g.animations) { actions[c.name] = mixer.clipAction(c); durations[c.name] = c.duration; }
+  return { kind: 'glb', root, mixer, actions, durations, current: null, currentAction: null };
 }
 
-function setAction(a, name, timeScale = 1) {
+function setAction(a, name, timeScale = 1, fade = 0.35, once = false) {
   const A = a.ap;
-  if (A.kind !== 'glb' || A.current === name) return;
+  if (A.kind !== 'glb') return;
+  if (A.current === name && !once) return;
   const next = A.actions[name];
   if (!next) return;
-  next.reset(); next.timeScale = timeScale; next.play();
-  if (A.currentAction) next.crossFadeFrom(A.currentAction, 0.35, false);
+  next.reset(); next.timeScale = timeScale;
+  if (once) { next.setLoop(THREE.LoopOnce, 1); next.clampWhenFinished = true; }
+  else next.setLoop(THREE.LoopRepeat, Infinity);
+  next.play();
+  if (A.currentAction && A.currentAction !== next) next.crossFadeFrom(A.currentAction, fade, false);
   A.current = name; A.currentAction = next;
 }
 
@@ -629,6 +635,7 @@ for (const ex of EXHIBITS) {
       phase: Math.random() * 10,
       graze: Math.random() * 8,   // countdown to graze pause
       grazing: 0,
+      state: 'ROAM', stateT: Math.random() * 3, speedNow: 0,
     });
   }
 }
@@ -653,16 +660,16 @@ const flyers = [];
       inst.traverse(o => { if (o.isMesh) { o.castShadow = true; } });
       const root = new THREE.Group(); root.add(inst);
       const mixer = new THREE.AnimationMixer(inst);
-      const fly = g.animations.find(c => c.name === 'Fly');
-      if (fly) mixer.clipAction(fly).play();
+      const actions = {}, durations = {};
+      for (const c of g.animations) { actions[c.name] = mixer.clipAction(c); durations[c.name] = c.duration; }
       scene.add(root);
-      fl = { kind: 'glb', root, mixer };
+      fl = { kind: 'glb', root, mixer, actions, durations, current: null, currentAction: null };
     } else {
       const parts = buildCreature(pteroSpec);
       scene.add(parts.root);
       fl = { kind: 'proc', root: parts.root, parts };
     }
-    flyers.push({ fl, r: 34 + i * 14, h: 34 + i * 7, ang: (i / 3) * Math.PI * 2, speed: 0.14 + i * 0.03, flap: Math.random() * 7 });
+    flyers.push({ fl, r: 34 + i * 14, h: 34 + i * 7, ang: (i / 3) * Math.PI * 2, speed: 0.14 + i * 0.03, flap: Math.random() * 7, mode: 'Fly', modeT: 3 + Math.random() * 5 });
   }
 }
 
@@ -680,23 +687,111 @@ const flyers = [];
   board.position.set(0, 7, 66.45); scene.add(board);
 }
 
-/* ============================== animation ============================== */
+/* ============================== animation ==============================
+   Behavior engine: each resident runs a little mind - roam, graze, idle,
+   run bursts, calls, bites, tail swipes, and real sleep when the park
+   clock says it's night. Wake-ups at dawn come with a stretch and a call. */
+const NIGHT_START = 21.5, NIGHT_END = 5.5;
+function isNight() { const h = parkMins / 60; return h >= NIGHT_START || h < NIGHT_END; }
+
+function pickState(a) {
+  const herb = !!a.ap.actions.Graze;
+  const r = Math.random();
+  if (herb) {
+    if (r < 0.38) return 'ROAM';
+    if (r < 0.60) return 'GRAZE';
+    if (r < 0.74) return 'IDLE';
+    if (r < 0.84) return 'RUN';
+    if (r < 0.92) return 'CALL';
+    return 'SWIPE';
+  }
+  if (r < 0.40) return 'ROAM';
+  if (r < 0.60) return 'IDLE';
+  if (r < 0.74) return 'RUN';
+  if (r < 0.86) return 'CALL';
+  if (r < 0.94) return 'BITE';
+  return 'SWIPE';
+}
+
+function enterState(a, st) {
+  a.state = st;
+  const D = a.ap.durations || {};
+  const freqScale = (2 * Math.PI) / a.ex.spec.gait.freq;
+  switch (st) {
+    case 'ROAM':
+      a.pathR = a.ex.padR * (0.3 + Math.random() * 0.45);
+      if (Math.random() < 0.25) a.dir *= -1;
+      a.speedNow = a.speed;
+      setAction(a, 'Walk', freqScale * (D.Walk || 1), 0.45);
+      a.stateT = 6 + Math.random() * 9;
+      break;
+    case 'RUN':
+      a.speedNow = a.speed * 2.4;
+      setAction(a, 'Run', freqScale * (D.Run || 0.6) * 1.2, 0.3);
+      a.stateT = 2.5 + Math.random() * 2.5;
+      break;
+    case 'GRAZE':
+      setAction(a, 'Graze', 1, 0.6);
+      a.stateT = 4 + Math.random() * 5;
+      break;
+    case 'IDLE':
+      setAction(a, 'Idle', 1, 0.6);
+      a.stateT = 4 + Math.random() * 6;
+      break;
+    case 'CALL': {
+      const nm = a.ap.actions.Roar ? 'Roar' : 'Call';
+      setAction(a, nm, 1, 0.4, true);
+      a.stateT = (D[nm] || 2.5) + 0.3;
+      break;
+    }
+    case 'BITE':
+      if (!a.ap.actions.Bite) { enterState(a, 'IDLE'); return; }
+      setAction(a, 'Bite', 1, 0.3, true);
+      a.stateT = (D.Bite || 1.5) + 0.2;
+      break;
+    case 'SWIPE':
+      if (!a.ap.actions.TailSwipe) { enterState(a, 'IDLE'); return; }
+      setAction(a, 'TailSwipe', 1, 0.4, true);
+      a.stateT = (D.TailSwipe || 2) + 0.2;
+      break;
+    case 'SLEEP':
+      if (!a.ap.actions.Sleep) { enterState(a, 'IDLE'); return; }
+      setAction(a, 'Sleep', 1, 1.6);
+      a.stateT = 20 + Math.random() * 20;
+      break;
+  }
+}
+
+function think(a) {
+  if (isNight()) {
+    if (a.state !== 'SLEEP' && Math.random() < 0.75) return enterState(a, 'SLEEP');
+    if (a.state === 'SLEEP') { a.stateT = 20 + Math.random() * 20; return; }
+    return enterState(a, Math.random() < 0.5 ? 'IDLE' : 'ROAM');
+  }
+  if (a.state === 'SLEEP') return enterState(a, 'CALL');  // dawn stretch
+  enterState(a, pickState(a));
+}
+
+function exhibitCall(ex) {
+  for (const a of animals) {
+    if (a.ex !== ex || a.ap.kind !== 'glb' || a.state === 'SLEEP') continue;
+    enterState(a, 'CALL');
+  }
+}
+
 function animateAnimal(a, t, dt) {
   const { ex } = a;
   const g = ex.spec.gait;
 
   if (a.ap.kind === 'glb') {
-    a.graze -= dt;
-    if (a.graze <= 0) { a.grazing = 2.5 + Math.random() * 3; a.graze = 6 + Math.random() * 10; }
-    if (a.grazing > 0) a.grazing -= dt;
-    const moving = a.grazing > 0 ? 0 : 1;
-    if (moving) a.ang += (a.speed * dt / a.pathR) * a.dir;
+    a.stateT -= dt;
+    if (a.stateT <= 0) think(a);
+    const moving = a.state === 'ROAM' || a.state === 'RUN';
+    if (moving) a.ang += (a.speedNow * dt / a.pathR) * a.dir;
     const [cx, cz] = ex.pos;
     a.ap.root.position.set(cx + Math.cos(a.ang) * a.pathR, 0, cz + Math.sin(a.ang) * a.pathR);
     const heading = a.ang + a.dir * Math.PI / 2;
     a.ap.root.rotation.y = -heading + (a.dir > 0 ? 0 : Math.PI);
-    const want = a.grazing > 0 ? 'Graze' : (moving ? 'Walk' : 'Idle');
-    setAction(a, want, want === 'Walk' ? (2 * Math.PI) / g.freq : 1);
     a.ap.mixer.update(dt);
     return;
   }
@@ -749,13 +844,36 @@ function animateAnimal(a, t, dt) {
 }
 
 function animateFlyer(f, t, dt) {
+  if (f.fl.kind === 'glb') {
+    f.modeT -= dt;
+    if (f.modeT <= 0) {
+      f.mode = f.mode === 'Fly' ? 'Glide' : (Math.random() < 0.7 ? 'Fly' : (f.fl.actions.Call ? 'Call' : 'Fly'));
+      f.modeT = f.mode === 'Glide' ? 5 + Math.random() * 6 : 3.5 + Math.random() * 4.5;
+    }
+    if (f.fl.current !== f.mode && f.fl.actions[f.mode]) {
+      const next = f.fl.actions[f.mode];
+      next.reset(); next.timeScale = f.mode === 'Fly' ? 1.1 : 1;
+      next.setLoop(THREE.LoopRepeat, Infinity); next.play();
+      if (f.fl.currentAction) next.crossFadeFrom(f.fl.currentAction, 0.6, false);
+      f.fl.current = f.mode; f.fl.currentAction = next;
+    }
+    f.ang += f.speed * (f.mode === 'Glide' ? 1.35 : 1) * dt;
+    const x = Math.cos(f.ang) * f.r, z = Math.sin(f.ang) * f.r * 0.8;
+    const lift = f.mode === 'Glide' ? -2 : (f.mode === 'Call' ? 1.5 : 0);
+    f.liftCur = (f.liftCur || 0) + (lift - (f.liftCur || 0)) * Math.min(1, dt * 1.5);
+    const y = f.h + Math.sin(t * 0.5 + f.r) * 3 + f.liftCur;
+    f.fl.root.position.set(x, y, z);
+    f.fl.root.rotation.y = -f.ang - Math.PI / 2 + Math.PI;
+    f.fl.root.rotation.z = 0.18;
+    f.fl.mixer.update(dt);
+    return;
+  }
   f.ang += f.speed * dt;
   const x = Math.cos(f.ang) * f.r, z = Math.sin(f.ang) * f.r * 0.8;
   const y = f.h + Math.sin(t * 0.5 + f.r) * 3;
   f.fl.root.position.set(x, y, z);
   f.fl.root.rotation.y = -f.ang - Math.PI / 2 + Math.PI;
   f.fl.root.rotation.z = 0.18; // bank into the circle
-  if (f.fl.kind === 'glb') { f.fl.mixer.update(dt); return; }
   const flap = Math.sin(t * 5 + f.flap);
   for (const w of f.fl.parts.wings) w.piv.rotation.z = w.side * flap * 0.55;
   f.fl.parts.tail.forEach(p => { p.rotation.y = Math.sin(t * 2) * 0.1; });
@@ -797,7 +915,7 @@ renderer.domElement.addEventListener('pointerup', e => {
   ptr.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
   ray.setFromCamera(ptr, camera);
   const hit = ray.intersectObjects(hitTargets)[0];
-  if (hit) showPlacard(hit.object.userData.exhibit);
+  if (hit) { showPlacard(hit.object.userData.exhibit); exhibitCall(hit.object.userData.exhibit); }
 });
 
 /* guided tour */
