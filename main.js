@@ -635,7 +635,7 @@ for (const ex of EXHIBITS) {
       phase: Math.random() * 10,
       graze: Math.random() * 8,   // countdown to graze pause
       grazing: 0,
-      state: 'ROAM', stateT: Math.random() * 3, speedNow: 0,
+      state: 'ROAM', stateT: Math.random() * 1.5, speedNow: 0,
     });
   }
 }
